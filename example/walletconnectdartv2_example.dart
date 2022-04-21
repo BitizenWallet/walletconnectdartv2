@@ -1,11 +1,20 @@
+import 'package:walletconnectdartv2/mock/mock_storage.dart';
 import 'package:walletconnectdartv2/walletconnectdartv2.dart';
 
-void main() {
-  var uri1 = WalletConnectURI.parse(
-      'wc://be93382bb37cc25e05fafe6e839929a5476b395a3204f9dff738ded1f5440709@2?controller=false&publicKey=8c3aa3a733e4594ee5466154310aac7898e9da5edd453bae6897665aa7f66e57&relay=%7B%22protocol%22%3A%22waku%22%7D');
-  var uri2 = WalletConnectURI.parse(
-      'wc:be93382bb37cc25e05fafe6e839929a5476b395a3204f9dff738ded1f5440709@2?controller=false&publicKey=8c3aa3a733e4594ee5466154310aac7898e9da5edd453bae6897665aa7f66e57&relay=%7B%22protocol%22%3A%22waku%22%7D');
-  print('uri1: ${uri1.absoluteString}');
-  print('uri2: ${uri2.absoluteString}');
-  assert(uri1.absoluteString == uri2.absoluteString);
+void main() async {
+  var uri = WalletConnectURI.parse(
+      'wc:3cf65a668f7665ae9e2e2139a3b6fffad379f23a7e92f32ee5bfca61e7bfe426@2?controller=false&publicKey=42f8273ba5b76586c59ac2249e00cbf0ede3df6cb48e5379c21c0360ac0b0b14&relay=%7B%22protocol%22%3A%22waku%22%7D');
+  final client = Client(
+      metadata: AppMetadata(
+        name: "Bitizen",
+        description: "BitizenWallet",
+        url: "https://bitizen.org",
+        icons: [
+          "https://bitizen.org/wp-content/uploads/2021/07/cropped-cropped-lALPBGnDc6ar_GfNBADNBAA_1024_1024.png_720x720g-192x192.jpg"
+        ],
+      ),
+      projectId: '', // TODO: set your project id
+      relayHost: 'relay.walletconnect.com',
+      kms: KeyManagementService(storage: MockStorage()));
+  await client.approve(uri);
 }

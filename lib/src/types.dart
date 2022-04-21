@@ -1,5 +1,6 @@
 import 'dart:convert';
-import 'dart:math';
+import 'dart:developer';
+import 'dart:math' as math;
 
 import 'package:cryptography/cryptography.dart';
 import 'package:json_annotation/json_annotation.dart';
@@ -67,7 +68,7 @@ class PairingTypeJSONRPC {
   static final payloadMethodSessionPropose = "wc_sessionPropose";
 }
 
-@JsonSerializable()
+@JsonSerializable(includeIfNull: false)
 class PairingParticipant {
   String publicKey;
   PairingParticipant({required this.publicKey});
@@ -78,7 +79,7 @@ class PairingParticipant {
   Map<String, dynamic> toJson() => _$PairingParticipantToJson(this);
 }
 
-@JsonSerializable()
+@JsonSerializable(includeIfNull: false)
 class AppMetadata {
   String? name;
   String? description;
@@ -98,7 +99,7 @@ class AppMetadata {
   Map<String, dynamic> toJson() => _$AppMetadataToJson(this);
 }
 
-@JsonSerializable()
+@JsonSerializable(includeIfNull: false)
 class PairingState {
   AppMetadata? metadata;
 
@@ -110,8 +111,9 @@ class PairingState {
   Map<String, dynamic> toJson() => _$PairingStateToJson(this);
 }
 
-@JsonSerializable()
-class PairingTypeApprovalParams extends Encodeable<PairingTypeApprovalParams> {
+@JsonSerializable(includeIfNull: false)
+class PairingTypeApprovalParams
+    implements Encodeable<PairingTypeApprovalParams> {
   RelayProtocolOptions relay;
   PairingParticipant responder;
   int expiry;
@@ -129,11 +131,6 @@ class PairingTypeApprovalParams extends Encodeable<PairingTypeApprovalParams> {
 
   @override
   Map<String, dynamic> toJson() => _$PairingTypeApprovalParamsToJson(this);
-
-  @override
-  PairingTypeApprovalParams fromJson(Object? json) {
-    return fromJson(json);
-  }
 }
 
 class PairingProposer {
@@ -168,6 +165,7 @@ class ProposedPermissions {
           methods: [PairingTypeJSONRPC.payloadMethodSessionPropose]));
 }
 
+@DurationJsonConverter()
 class PairingProposal {
   String topic;
   RelayProtocolOptions relay;
@@ -201,31 +199,9 @@ class PairingSequence {
   static Duration timeToLiveSettled = Duration(days: 30);
 }
 
-class SimplePublicKeyJsonConverter
-    implements JsonConverter<SimplePublicKey, Map<String, dynamic>> {
-  const SimplePublicKeyJsonConverter();
-  @override
-  Map<String, dynamic> toJson(SimplePublicKey key) {
-    assert(key.type.name == 'x25519', 'Only x25519 keys are supported');
-    return {
-      'type': 'x25519',
-      'bytes': key.bytes.hexWith0x,
-    };
-  }
-
-  @override
-  SimplePublicKey fromJson(Map<String, dynamic> json) {
-    assert(json['type'] == 'x25519', 'Invalid public key type');
-    return SimplePublicKey(
-      (json['bytes'] as String).bytes,
-      type: KeyPairType.x25519,
-    );
-  }
-}
-
-@JsonSerializable()
+@JsonSerializable(includeIfNull: false)
 @SimplePublicKeyJsonConverter()
-class AgreementSecret extends Encodeable<AgreementSecret> {
+class AgreementSecret implements Encodeable<AgreementSecret> {
   List<int> sharedSecret;
   SimplePublicKey publicKey;
 
@@ -233,7 +209,7 @@ class AgreementSecret extends Encodeable<AgreementSecret> {
 
   Future<String> derivedTopic() async {
     final hash = await Sha256().hash(sharedSecret);
-    return hash.bytes.hexWith0x;
+    return hash.bytes.hexWithout0x;
   }
 
   factory AgreementSecret.fromJson(Map<String, dynamic> json) =>
@@ -241,16 +217,6 @@ class AgreementSecret extends Encodeable<AgreementSecret> {
 
   @override
   Map<String, dynamic> toJson() => _$AgreementSecretToJson(this);
-
-  @override
-  AgreementSecret fromJson(Object? json) {
-    return fromJson(json);
-  }
-}
-
-abstract class Encodeable<T> {
-  Map<String, dynamic> toJson();
-  T fromJson(Object? json);
 }
 
 enum WCRequestMethod {
@@ -258,9 +224,19 @@ enum WCRequestMethod {
   wcPairingApprove,
 }
 
-@JsonSerializable(genericArgumentFactories: true)
-class WCRequest<T extends Encodeable<T>> {
-  late int id;
+extension WCRequestMethodExtension on WCRequestMethod {
+  bool get shouldPrompt {
+    switch (this) {
+      // TODO .sessionPayload, .pairingPayload
+      default:
+        return false;
+    }
+  }
+}
+
+@JsonSerializable(genericArgumentFactories: true, includeIfNull: false)
+class WCRequest<T extends Encodeable<T>> implements Encodeable<WCRequest> {
+  int id = generateId();
   String jsonrpc;
   WCRequestMethod method;
   T params;
@@ -273,23 +249,17 @@ class WCRequest<T extends Encodeable<T>> {
   }) {
     if (id != null) {
       this.id = id;
-    } else {
-      id = generateId();
     }
   }
 
   factory WCRequest.fromJson(Map<String, dynamic> json) {
     return _$WCRequestFromJson(
-        json, (Object? json) => (T as Encodeable).fromJson(json));
+        json, (Object? json) => Encodeable.fromJsonMixin<T>(json)!);
   }
 
+  @override
   Map<String, dynamic> toJson() {
     return _$WCRequestToJson(this, (T t) => t.toJson());
-  }
-
-  static int generateId() {
-    return DateTime.now().millisecondsSinceEpoch * 1000 +
-        Random().nextInt(1000);
   }
 }
 
@@ -304,4 +274,194 @@ class EncryptionPayload {
       required this.publicKey,
       required this.mac,
       required this.cipherText});
+
+  static int ivLength = 16;
+  static int publicKeyLength = 32;
+  static int macLength = 32;
+}
+
+const Duration relayDefaultTtl = Duration(hours: 6);
+
+enum RelayJSONRPCMethod {
+  @JsonValue("waku_subscribe")
+  subscribe,
+  @JsonValue("waku_publish")
+  publish,
+  @JsonValue("waku_subscription")
+  subscription,
+  @JsonValue("waku_unsubscribe")
+  unsubscribe,
+}
+
+@JsonSerializable(includeIfNull: false)
+@DurationJsonConverter()
+class RelayJSONRPCPublishParams
+    implements Encodeable<RelayJSONRPCPublishParams> {
+  String topic;
+  String message;
+  Duration ttl;
+  bool? prompt;
+  RelayJSONRPCPublishParams({
+    required this.topic,
+    required this.message,
+    required this.ttl,
+    this.prompt,
+  });
+
+  factory RelayJSONRPCPublishParams.fromJson(Map<String, dynamic> json) {
+    return _$RelayJSONRPCPublishParamsFromJson(json);
+  }
+
+  @override
+  Map<String, dynamic> toJson() {
+    return _$RelayJSONRPCPublishParamsToJson(this);
+  }
+}
+
+@JsonSerializable(genericArgumentFactories: true, includeIfNull: false)
+class JSONRPCRequest<T extends Encodeable<T>> {
+  int id = generateId();
+  String jsonrpc;
+  RelayJSONRPCMethod? method;
+  T params;
+
+  JSONRPCRequest({
+    required this.params,
+    int? id,
+    this.jsonrpc = "2.0",
+    this.method,
+  }) {
+    if (id != null) {
+      this.id = id;
+    }
+  }
+
+  factory JSONRPCRequest.fromJson(Map<String, dynamic> json) {
+    log("JSONRPCRequest.fromJson $T $json", name: packageName);
+    return _$JSONRPCRequestFromJson(
+        json, (Object? json) => Encodeable.fromJsonMixin<T>(json)!);
+  }
+
+  Map<String, dynamic> toJson() {
+    return _$JSONRPCRequestToJson(this, (T t) => t.toJson());
+  }
+}
+
+@JsonSerializable(includeIfNull: false)
+class JSONRPCErrorResponseError {
+  int code;
+  String message;
+  JSONRPCErrorResponseError({required this.code, required this.message});
+
+  factory JSONRPCErrorResponseError.fromJson(Map<String, dynamic> json) {
+    return _$JSONRPCErrorResponseErrorFromJson(json);
+  }
+
+  Map<String, dynamic> toJson() {
+    return _$JSONRPCErrorResponseErrorToJson(this);
+  }
+}
+
+@JsonSerializable(includeIfNull: false, genericArgumentFactories: true)
+class JSONRPCResponse<T extends Encodeable<T>> {
+  String jsonrpc;
+  int id;
+  T result;
+
+  JSONRPCResponse({
+    required this.id,
+    required this.result,
+    this.jsonrpc = "2.0",
+  });
+
+  factory JSONRPCResponse.fromJson(Map<String, dynamic> json) {
+    log("JSONRPCResponse.fromJson $T $json", name: packageName);
+    return _$JSONRPCResponseFromJson(
+        json, (Object? json) => Encodeable.fromJsonMixin<T>(json)!);
+  }
+
+  Map<String, dynamic> toJson() {
+    return _$JSONRPCResponseToJson(this, (T t) => t.toJson());
+  }
+}
+
+@JsonSerializable(includeIfNull: false)
+class JSONRPCErrorResponse {
+  String jsonrpc;
+  int id;
+  JSONRPCErrorResponseError error;
+
+  JSONRPCErrorResponse(
+      {required this.id, required this.error, this.jsonrpc = "2.0"});
+
+  factory JSONRPCErrorResponse.fromJson(Map<String, dynamic> json) {
+    return _$JSONRPCErrorResponseFromJson(json);
+  }
+
+  Map<String, dynamic> toJson() {
+    return _$JSONRPCErrorResponseToJson(this);
+  }
+}
+
+@JsonSerializable(includeIfNull: false)
+class RelayJSONRPCSubscribeParams
+    implements Encodeable<RelayJSONRPCSubscribeParams> {
+  String topic;
+  RelayJSONRPCSubscribeParams({
+    required this.topic,
+  });
+
+  factory RelayJSONRPCSubscribeParams.fromJson(Map<String, dynamic> json) {
+    return _$RelayJSONRPCSubscribeParamsFromJson(json);
+  }
+
+  @override
+  Map<String, dynamic> toJson() {
+    return _$RelayJSONRPCSubscribeParamsToJson(this);
+  }
+}
+
+@JsonSerializable(includeIfNull: false)
+class RelayJSONRPCSubscriptionData {
+  String topic;
+  String message;
+
+  RelayJSONRPCSubscriptionData({
+    required this.topic,
+    required this.message,
+  });
+
+  factory RelayJSONRPCSubscriptionData.fromJson(Map<String, dynamic> json) {
+    return _$RelayJSONRPCSubscriptionDataFromJson(json);
+  }
+
+  Map<String, dynamic> toJson() {
+    return _$RelayJSONRPCSubscriptionDataToJson(this);
+  }
+}
+
+@JsonSerializable(includeIfNull: false)
+class RelayJSONRPCSubscriptionParams
+    implements Encodeable<RelayJSONRPCSubscriptionParams> {
+  String id;
+  RelayJSONRPCSubscriptionData data;
+
+  RelayJSONRPCSubscriptionParams({
+    required this.id,
+    required this.data,
+  });
+
+  factory RelayJSONRPCSubscriptionParams.fromJson(Map<String, dynamic> json) {
+    return _$RelayJSONRPCSubscriptionParamsFromJson(json);
+  }
+
+  @override
+  Map<String, dynamic> toJson() {
+    return _$RelayJSONRPCSubscriptionParamsToJson(this);
+  }
+}
+
+int generateId() {
+  return DateTime.now().millisecondsSinceEpoch * 1000 +
+      math.Random().nextInt(1000);
 }

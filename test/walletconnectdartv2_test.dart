@@ -1,6 +1,4 @@
 import 'package:cryptography/cryptography.dart';
-import 'package:walletconnectdartv2/mock/mock_storage.dart';
-import 'package:walletconnectdartv2/src/key_managment_service.dart';
 import 'package:walletconnectdartv2/walletconnectdartv2.dart';
 import 'package:test/test.dart';
 
@@ -26,12 +24,6 @@ void main() {
           await x25519.newKeyPairFromSeed(await kpOld.extractPrivateKeyBytes());
       final kpNewPubkeyBytes = (await kpNew.extractPublicKey()).bytes;
       expect(kpOldPubkeyBytes, kpNewPubkeyBytes);
-    });
-
-    test('test approve', () async {
-      final wcUri = WalletConnectURI.parse(rawUri);
-      final client = Client(kms: KeyManagementService(storage: MockStorage()));
-      await client.approve(wcUri);
     });
   });
 }

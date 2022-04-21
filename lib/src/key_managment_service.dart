@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:developer';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
@@ -15,7 +16,7 @@ class KeyManagementService {
     final SimpleKeyPair keyPair = await algorithm.newKeyPair();
     final SimplePublicKey pubkey = await keyPair.extractPublicKey();
     await _setPrivateKey(pubkey.bytes.hexWith0x, keyPair);
-    return keyPair.extractPublicKey();
+    return pubkey;
   }
 
   Future<SimpleKeyPair?> _getPrivateKey(String pubkeyHash) async {
@@ -42,9 +43,9 @@ class KeyManagementService {
     return AgreementSecret.fromJson(jsonDecode(String.fromCharCodes(data)));
   }
 
-  _setAgreementSecret(String topic, AgreementSecret secret) async {
+  setAgreementSecret(String topic, AgreementSecret secret) async {
     final ok = await storage.write(
-        "agms::$topic", Uint8List.fromList(jsonEncode(secret).bytes));
+        "agms::$topic", Uint8List.fromList(jsonEncode(secret).codeUnits));
     assert(ok, 'Failed to write agreement secret');
   }
 
@@ -62,7 +63,7 @@ class KeyManagementService {
       required String peerPublicKeyHex}) async {
     final algorithm = Cryptography.instance.x25519();
     final peerPublicKey =
-        SimplePublicKey(peerPublicKeyHex.bytes, type: KeyPairType.x25519);
+        SimplePublicKey(peerPublicKeyHex.hexDecode, type: KeyPairType.x25519);
     final SecretKey sharedSecret = await algorithm.sharedSecretKey(
         keyPair: selfPrivateKey, remotePublicKey: peerPublicKey);
     final sharedSecretBytes = await sharedSecret.extractBytes();
@@ -71,33 +72,47 @@ class KeyManagementService {
         publicKey: await selfPrivateKey.extractPublicKey());
   }
 
-  Future<String> serialize<T>(T req, String topic) async {
-    String json = jsonEncode(req);
+  Future<String> serialize<T extends Encodeable>(T req, String topic) async {
+    String json = jsonEncode(req.toJson());
+    log("serialize req $json", name: packageName);
     final agreementSecret = await _getAgreementSecret(topic);
     if (agreementSecret != null) {
       final payload = await _encrypt(json, agreementSecret);
       return '${payload.iv.hexWithout0x}${payload.publicKey.hexWithout0x}${payload.mac.hexWithout0x}${payload.cipherText.hexWithout0x}';
     }
-    return json.bytes.hexWithout0x;
+    return json.codeUnits.hexWithout0x;
+  }
+
+  Future<T> deserialize<T extends Encodeable>(
+      String topic, String message) async {
+    final agreementSecret = await _getAgreementSecret(topic);
+    if (agreementSecret != null) {
+      final payload = await _decrypt(message, agreementSecret);
+      return Encodeable.fromJsonMixin<T>(jsonDecode(payload))!;
+    }
+    return Encodeable.fromJsonMixin<T>(
+        jsonDecode(String.fromCharCodes(message.hexDecode)))!;
   }
 
   /// _getKeyPair returns a tuple of (encryptionKey, authenticationKey)
-  Tuple2<List<int>, List<int>> _getKeyPair(List<int> sharedSecret) {
-    assert(sharedSecret.length == 64, 'Invalid shared secret');
-    return Tuple2(sharedSecret.sublist(0, 32), sharedSecret.sublist(32, 64));
+  Future<Tuple2<List<int>, List<int>>> _getKeyPair(
+      List<int> sharedSecret) async {
+    final hash = await Sha512().hash(sharedSecret);
+    return Tuple2(hash.bytes.sublist(0, 32), hash.bytes.sublist(32, 64));
   }
 
   Future<EncryptionPayload> _encrypt(
       String json, AgreementSecret agreementSecret) async {
     // encrypt
-    final keyPair = _getKeyPair(agreementSecret.sharedSecret);
+    final keyPair = await _getKeyPair(agreementSecret.sharedSecret);
     final aesCbc256 = AesCbc.with256bits(macAlgorithm: MacAlgorithm.empty);
     final iv = aesCbc256.newNonce();
-    final cipher = await aesCbc256.encrypt(json.bytes,
+    final cipher = await aesCbc256.encrypt(json.codeUnits,
         secretKey: SecretKey(keyPair.item1), nonce: iv);
 
     // encode
-    final dataToMac = iv;
+    final List<int> dataToMac = [];
+    dataToMac.addAll(iv);
     dataToMac.addAll(agreementSecret.publicKey.bytes);
     dataToMac.addAll(cipher.cipherText);
 
@@ -108,5 +123,54 @@ class KeyManagementService {
         publicKey: agreementSecret.publicKey.bytes,
         mac: mac.bytes,
         cipherText: cipher.cipherText);
+  }
+
+  Future<String> _decrypt(
+      String message, AgreementSecret agreementSecret) async {
+    final cipherData = message.codeUnits;
+    assert(
+        cipherData.length >
+            EncryptionPayload.ivLength +
+                EncryptionPayload.macLength +
+                EncryptionPayload.publicKeyLength,
+        'message too short');
+
+    // decode
+
+    final pubKeyRangeStartIndex = EncryptionPayload.ivLength;
+    final macStartIndex =
+        pubKeyRangeStartIndex + EncryptionPayload.publicKeyLength;
+    final cipherTextStartIndex = macStartIndex + EncryptionPayload.macLength;
+
+    final iv = cipherData.sublist(0, pubKeyRangeStartIndex);
+    final pubKey = cipherData.sublist(pubKeyRangeStartIndex, macStartIndex);
+    final mac = cipherData.sublist(macStartIndex, cipherTextStartIndex);
+    final cipherText = cipherData.sublist(cipherTextStartIndex);
+
+    final payload = EncryptionPayload(
+        iv: iv, publicKey: pubKey, mac: mac, cipherText: cipherText);
+
+    // checksum
+
+    final keyPair = await _getKeyPair(agreementSecret.sharedSecret);
+    final List<int> dataToMac = [];
+    dataToMac.addAll(iv);
+    dataToMac.addAll(payload.publicKey);
+    dataToMac.addAll(payload.cipherText);
+    assert(
+        payload.mac ==
+            (await Hmac.sha256().calculateMac(dataToMac,
+                    secretKey: SecretKey(keyPair.item2)))
+                .bytes,
+        'MAC mismatch');
+
+    // decrypt
+
+    final aesCbc256 = AesCbc.with256bits(macAlgorithm: MacAlgorithm.empty);
+    final plainData = await aesCbc256.decrypt(
+        SecretBox(cipherText, nonce: iv, mac: Mac.empty),
+        secretKey: SecretKey(keyPair.item1));
+
+    return String.fromCharCodes(plainData);
   }
 }
